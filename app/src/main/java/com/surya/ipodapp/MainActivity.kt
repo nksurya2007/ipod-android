@@ -31,6 +31,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import android.widget.Toast
 import java.util.Date
 import kotlin.math.max
 
@@ -82,6 +83,11 @@ class MainActivity : Activity() {
         ARTISTS("artists", "Artists"),
         ALBUMS("albums", "Albums"),
         PLAYLISTS("playlists", "Playlists")
+    }
+
+    private companion object {
+        const val REQ_FOLDER = 42
+        const val FOLDER_MENU = "Music Folder"
     }
 
     private val prefs by lazy { getSharedPreferences("ipod", MODE_PRIVATE) }
@@ -159,14 +165,16 @@ class MainActivity : Activity() {
         wireWheel()
         wheel.style = WheelStyle.all[wheelIndex]
 
-        stack.add(if (hasAudioAccess()) mainMenu() else noAccessMenu())
+        stack.add(if (hasLibraryAccess()) mainMenu() else noAccessMenu())
         render()
-        if (!hasAudioAccess()) requestAudioAccess()
+        if (Library.folderUri(this) != null) startScan()
+        if (!hasLibraryAccess()) requestAudioAccess()
     }
 
     private val ticker = object : Runnable {
         override fun run() {
             updateNP()
+            if (Library.scanning) refreshMusicMenu()
             handler.postDelayed(this, 500)
         }
     }
@@ -174,7 +182,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         hideSystemUi()
-        if (hasAudioAccess() && stack.size == 1 && stack[0].rows.firstOrNull()?.title == "Allow Music access") {
+        if (hasLibraryAccess() && stack.size == 1 && stack[0].rows.firstOrNull()?.title == "Allow Music access") {
             stack[0] = mainMenu()
             render()
         }
@@ -220,6 +228,9 @@ class MainActivity : Activity() {
     private fun hasAudioAccess(): Boolean =
         Build.VERSION.SDK_INT < 23 || checkSelfPermission(audioPerm()) == PackageManager.PERMISSION_GRANTED
 
+    /** Either the audio permission is granted, or the user picked a music folder (no permission needed). */
+    private fun hasLibraryAccess(): Boolean = hasAudioAccess() || Library.folderUri(this) != null
+
     private fun requestAudioAccess() {
         if (Build.VERSION.SDK_INT >= 23) requestPermissions(arrayOf(audioPerm()), 1)
     }
@@ -236,6 +247,58 @@ class MainActivity : Activity() {
     private fun openAppSettings() {
         val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
         startActivity(i)
+    }
+
+    // ---------------------------------------------------------------- music folder
+    private fun pickFolder() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(i, REQ_FOLDER)
+        } catch (e: Exception) {
+            Toast.makeText(this, "No folder picker available on this device", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_FOLDER || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: Exception) {
+        }
+        Library.setFolder(this, uri)
+        songs = emptyList()
+        if (stack.isNotEmpty() && stack[0].rows.firstOrNull()?.title == "Allow Music access") {
+            stack[0] = mainMenu()
+        }
+        startScan()
+        render()
+    }
+
+    private fun startScan() {
+        Library.scan(this) { refreshMusicMenu() }
+        refreshMusicMenu()
+    }
+
+    private fun refreshMusicMenu() {
+        if (stack.lastOrNull()?.title == FOLDER_MENU) refreshTop(musicFolderMenu())
+    }
+
+    private fun usePhoneLibrary() {
+        Library.setFolder(this, null)
+        songs = emptyList()
+        if (!hasAudioAccess()) {
+            stack.clear()
+            stack.add(noAccessMenu())
+            render()
+            requestAudioAccess()
+        } else {
+            refreshTop(musicFolderMenu())
+        }
     }
 
     // ---------------------------------------------------------------- UI
@@ -472,6 +535,7 @@ class MainActivity : Activity() {
 
     private fun noAccessMenu(): Menu = Menu("iPod", listOf(
         Row("Allow Music access", "Grant") { requestAudioAccess() },
+        Row("Choose music folder", arrow = true) { pickFolder() },
         Row("App permission settings", arrow = true) { openAppSettings() },
         Row("Settings", arrow = true) { push(settingsMenu()) }
     ))
@@ -497,6 +561,10 @@ class MainActivity : Activity() {
 
     /** Opens Songs / Artists / Albums / Playlists as a line list or Cover Flow, per Settings. */
     private fun openList(k: Kind) {
+        if (Library.scanning) {
+            push(Menu(k.label, listOf(Row("Scanning folder... " + Library.scanned) {})))
+            return
+        }
         songs = Library.songs(this)
         val cf = viewMode(k) == 1
         if (k == Kind.SONGS) {
@@ -543,6 +611,7 @@ class MainActivity : Activity() {
         Row("Controller Style", arrow = true) { push(controllerMenu()) },
         Row("Cover Flow", arrow = true) { push(coverFlowSettingsMenu()) },
         Row("Sort", arrow = true) { push(sortMenu()) },
+        Row(FOLDER_MENU, arrow = true) { push(musicFolderMenu()) },
         Row("Click Sound", if (clickSoundOn) "On" else "Off") {
             val on = !clickSoundOn
             prefs.edit().putBoolean("clickSound", on).apply()
@@ -551,6 +620,23 @@ class MainActivity : Activity() {
         },
         Row("About", arrow = true) { push(aboutMenu()) }
     ))
+
+    /** Choose a folder to read music from, rescan it, or go back to the phone's library. */
+    private fun musicFolderMenu(): Menu {
+        val folder = Library.folderUri(this)
+        val rows = ArrayList<Row>()
+        rows.add(Row("Choose Folder", if (folder != null) Library.folderName(folder) else null) { pickFolder() })
+        if (folder != null) {
+            rows.add(
+                Row(
+                    "Rescan Folder",
+                    if (Library.scanning) "Scanning " + Library.scanned else Library.folderCount.toString() + " songs"
+                ) { if (!Library.scanning) startScan() }
+            )
+        }
+        rows.add(Row("Phone Library", if (folder == null) "\u2713" else null) { usePhoneLibrary() })
+        return Menu(FOLDER_MENU, rows)
+    }
 
     private fun themeMenu(): Menu {
         val rows = Theme.all.mapIndexed { i, t ->
